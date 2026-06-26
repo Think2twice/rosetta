@@ -39,6 +39,11 @@ export class RosettaUploadError extends Error {
   }
 }
 
+export function isLikelyImageAttachment(attachment: Attachment, fileName: string): boolean {
+  const mimeType = attachment.mimeType ?? guessMimeType(fileName);
+  return mimeType.toLowerCase().startsWith("image/");
+}
+
 /**
  * Inject a local file into ChatGPT's hidden `<input type="file">` so the page's
  * existing React upload pipeline runs end-to-end. Reads the file in Node,
@@ -175,9 +180,18 @@ export async function transferAttachmentViaDataTransfer(
  */
 export async function findFileInputSelector(
   runtime: ChromeClient["Runtime"],
+  attachment?: Attachment,
 ): Promise<string | null> {
+  const preferredSelectors = attachment && isLikelyImageAttachment(attachment, path.basename(attachment.path))
+    ? [
+        "#upload-photos",
+        'input[type="file"][data-testid="upload-photos-input"]',
+        'input[type="file"][accept^="image/"]',
+        ...FILE_INPUT_SELECTORS,
+      ]
+    : FILE_INPUT_SELECTORS;
   const expression = `(() => {
-    const selectors = ${JSON.stringify(FILE_INPUT_SELECTORS)};
+    const selectors = ${JSON.stringify(preferredSelectors)};
     for (const sel of selectors) {
       const el = document.querySelector(sel);
       if (el && el.tagName === 'INPUT' && el.type === 'file') {
@@ -226,9 +240,11 @@ export async function waitForAttachmentReady(
   //       "Processing…" indicator in flight (else the send button stays
   //       disabled and we'd race into a swallowed send).
   const stem = path.basename(fileName, path.extname(fileName));
+  const imageAttachment = isLikelyImageAttachment(attachment, fileName);
   const expression = `(() => {
     const name = ${JSON.stringify(fileName)}.toLowerCase();
     const stem = ${JSON.stringify(stem)}.toLowerCase();
+    const imageAttachment = ${JSON.stringify(imageAttachment)};
     // Match the full filename, or the stem when it's distinctive enough that a
     // truncated chip ("my-long-na…") won't false-match generic UI text.
     const candidates = Array.from(document.querySelectorAll('div,span,button,a,p,li,h1,h2,h3'));
@@ -244,6 +260,21 @@ export async function waitForAttachmentReady(
         break;
       }
     }
+    let imageReady = false;
+    if (imageAttachment) {
+      imageReady = Array.from(document.querySelectorAll('button,[aria-label]')).some((el) => {
+        if (!(el instanceof HTMLElement)) return false;
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 40 || rect.height < 40) return false;
+        const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+        return aria.includes('user uploaded image') || aria.includes('open image');
+      }) || Array.from(document.images).some((img) => {
+        const rect = img.getBoundingClientRect();
+        if (rect.width < 40 || rect.height < 40) return false;
+        const alt = (img.alt || '').toLowerCase();
+        return img.src.startsWith('blob:') && !alt.includes('profile');
+      });
+    }
     const uploadingSelectors = ${JSON.stringify(UPLOAD_STATUS_SELECTORS)};
     const uploading = uploadingSelectors.some((sel) => {
       const nodes = Array.from(document.querySelectorAll(sel));
@@ -258,15 +289,15 @@ export async function waitForAttachmentReady(
         return /\\buploading\\b/.test(text) || /\\bprocessing\\b/.test(text);
       });
     });
-    return { chipNamed, uploading };
+    return { chipNamed, imageReady, uploading };
   })()`;
 
   while (Date.now() < deadline) {
     const r = await runtime.evaluate({ expression, returnByValue: true });
     const v = r.result?.value as
-      | { chipNamed?: boolean; uploading?: boolean }
+      | { chipNamed?: boolean; imageReady?: boolean; uploading?: boolean }
       | undefined;
-    if (v?.chipNamed && !v.uploading) {
+    if ((v?.chipNamed || v?.imageReady) && !v.uploading) {
       if (firstSeenAt === null) firstSeenAt = Date.now();
       if (Date.now() - firstSeenAt >= stableMs) return;
     } else {
@@ -384,7 +415,7 @@ export async function attachFiles(
     }
     const fileName = path.basename(absPath);
 
-    const selector = await findFileInputSelector(runtime);
+    const selector = await findFileInputSelector(runtime, attachment);
     if (!selector) {
       throw new RosettaUploadError(
         `Could not locate a file input on the ChatGPT page. The composer DOM may have changed; consider updating FILE_INPUT_SELECTORS.`,

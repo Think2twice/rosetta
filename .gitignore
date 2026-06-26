@@ -16,3 +16,6 @@ CLAUDE.md
 
 # image2 skill scratch outputs
 figures/ai_generated/
+
+# local data created by the OpenAI-compatible gateway example
+examples/openai-compatible-gateway/data/

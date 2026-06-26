@@ -5,7 +5,9 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import {
   MAX_DATA_TRANSFER_BYTES,
   RosettaUploadError,
+  findFileInputSelector,
   guessMimeType,
+  isLikelyImageAttachment,
   transferAttachmentViaDataTransfer,
 } from "../src/upload.js";
 
@@ -42,6 +44,41 @@ describe("guessMimeType", () => {
   test("handles double-extension (only last segment counts)", () => {
     expect(guessMimeType("archive.tar.gz")).toBe("application/gzip");
     expect(guessMimeType("backup.tar")).toBe("application/x-tar");
+  });
+});
+
+describe("image attachment routing", () => {
+  test("detects image attachments from explicit mime type or extension", () => {
+    expect(isLikelyImageAttachment({ path: "photo.bin", mimeType: "image/png" }, "photo.bin")).toBe(true);
+    expect(isLikelyImageAttachment({ path: "photo.jpg" }, "photo.jpg")).toBe(true);
+    expect(isLikelyImageAttachment({ path: "paper.pdf" }, "paper.pdf")).toBe(false);
+  });
+
+  test("tries the ChatGPT photo input first for image attachments", async () => {
+    const { runtime, captures } = makeStubRuntime(() => "#upload-photos");
+
+    const selector = await findFileInputSelector(
+      runtime as unknown as Parameters<typeof findFileInputSelector>[0],
+      { path: "photo.png" },
+    );
+
+    expect(selector).toBe("#upload-photos");
+    expect(captures[0]!.expression).toContain("#upload-photos");
+    expect(captures[0]!.expression.indexOf("#upload-photos")).toBeLessThan(
+      captures[0]!.expression.indexOf("form input[type=\\\"file\\\"]:not([accept])"),
+    );
+  });
+
+  test("keeps the generic selector order for non-image attachments", async () => {
+    const { runtime, captures } = makeStubRuntime(() => 'input[type="file"]');
+
+    const selector = await findFileInputSelector(
+      runtime as unknown as Parameters<typeof findFileInputSelector>[0],
+      { path: "paper.pdf" },
+    );
+
+    expect(selector).toBe('input[type="file"]');
+    expect(captures[0]!.expression).not.toContain("#upload-photos");
   });
 });
 

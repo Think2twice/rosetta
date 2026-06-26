@@ -1,0 +1,15 @@
+services:
+  rosetta-openai-gateway:
+    build:
+      context: ../..
+      dockerfile: examples/openai-compatible-gateway/Dockerfile
+    shm_size: "1gb"
+    env_file:
+      - ./.env
+    ports:
+      - "127.0.0.1:13283:3000"
+      - "127.0.0.1:13284:6080"
+      - "127.0.0.1:13285:9222"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped

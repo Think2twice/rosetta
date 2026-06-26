@@ -27,6 +27,16 @@ npm i @syntaxsmith/rosetta
 
 Requires Node ≥ 22.
 
+## OpenAI-compatible gateway
+
+This fork includes a Docker example that exposes Rosetta through a small OpenAI-style HTTP API:
+
+```text
+examples/openai-compatible-gateway/
+```
+
+It supports text chat, image inputs in `messages[].content`, image generation, and local URLs for generated images. The example README is intentionally explicit about login, noVNC, CDP, image extraction, and the parts that should stay private.
+
 ## Setup: launch Chrome
 
 You need a Chrome with `--remote-debugging-port` open and **logged in to chatgpt.com once**. Profile is reused across runs.

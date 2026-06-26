@@ -952,12 +952,7 @@ async function driveComposerSendInner(
   }
   dbg("focus poll exit", { hasFocus });
   if (!hasFocus) {
-    throw new RosettaRequestError(
-      "Could not bring tab to front (OS focus poll timed out)",
-      0,
-      undefined,
-      "trigger-failed",
-    );
+    dbg("focus poll failed; continuing with DOM input fallbacks", { hasFocus });
   }
   // Now insertText reliably lands.
   await Input.insertText({ text: promptText });
