@@ -9,7 +9,7 @@
 Rosetta 本体负责把消息发进 ChatGPT 网页，并把文本结果带回来。这个示例在它外面补了几件事：
 
 - 提供 `/v1/chat/completions`，普通文本请求可以按 OpenAI Chat Completions 的形状调用。
-- 支持 `messages[].content` 里的 `image_url` 和 `input_image`，会把图片保存成本地临时文件，再作为附件交给 ChatGPT 网页。
+- 支持 `messages[].content` 里的 `image_url`、`input_image`、`input_file`、`file` 和 `file_url`，会把远程文件或 base64 文件保存成本地临时文件，再作为附件交给 ChatGPT 网页。
 - 图片生成或图片编辑完成后，不只看页面上的 `<img>`。如果页面没有直接暴露图片 URL，会去会话 JSON 里找 `image_asset_pointer`，再用 ChatGPT 的 `files/download` 路由换成可下载地址。
 - 把生成图落到本地 `/data/generated-images`，再通过 `/v1/rosetta/images/<id>` 对外给一个稳定 URL。
 - 带一个浏览器版 noVNC 页面，方便你在服务器上完成 ChatGPT 登录。
@@ -106,6 +106,81 @@ gpt-5.5-thinking -> gpt-5-5-thinking
 ```
 
 不要用“你是 GPT 几”当作唯一判断。网页里的模型自报可能和页面左上角选择的档位不一致。更可靠的是看返回里的 `rosetta.modelSlug`，再配合实际能力和日志判断。
+
+## PDF 和普通文件请求
+
+如果你想让 ChatGPT 网页自己处理 PDF，不要先在外层把 PDF 拆成 RAG 文本。把 PDF 原文件传给这个网关，它会保存成临时文件，再交给 Rosetta 的附件上传流程。
+
+用 data URL 传 PDF：
+
+```bash
+KEY="<YOUR_LOCAL_GATEWAY_KEY>"
+PDF_B64="$(base64 -i ./sample.pdf | tr -d '\n')"
+
+curl http://127.0.0.1:13283/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model\": \"gpt-5.5\",
+    \"messages\": [
+      {
+        \"role\": \"user\",
+        \"content\": [
+          { \"type\": \"text\", \"text\": \"请总结这个 PDF 的核心内容。\" },
+          {
+            \"type\": \"input_file\",
+            \"filename\": \"sample.pdf\",
+            \"file_data\": \"data:application/pdf;base64,$PDF_B64\"
+          }
+        ]
+      }
+    ]
+  }"
+```
+
+也可以给一个公网可下载的文件 URL：
+
+```json
+{
+  "type": "file_url",
+  "file_url": {
+    "url": "https://example.com/sample.pdf",
+    "name": "sample.pdf"
+  }
+}
+```
+
+或者放到请求顶层：
+
+```json
+{
+  "model": "gpt-5.5",
+  "messages": [
+    { "role": "user", "content": "请提取这个 PDF 里的三条结论。" }
+  ],
+  "files": [
+    {
+      "url": "https://example.com/sample.pdf",
+      "name": "sample.pdf",
+      "mime_type": "application/pdf"
+    }
+  ]
+}
+```
+
+默认单个输入附件上限是 20 MB，可以用 `ROSETTA_MAX_INPUT_ATTACHMENT_BYTES` 调整。`ROSETTA_ALLOW_LOCAL_FILE_PATHS` 默认是 `false`，不要在公网服务里打开；如果打开，调用方就能要求网关读取服务器本地绝对路径文件。
+
+这条链路的目标是接近官方 ChatGPT 上传文件体验：
+
+```text
+外部客户端上传 PDF
+→ 网关保存原文件
+→ Rosetta 把它作为 ChatGPT 网页附件上传
+→ 官方 ChatGPT 网页/后端处理文件
+→ 文本回复回到客户端
+```
+
+它和 OpenWebUI 默认的 PDF/RAG 链路不同。OpenWebUI 默认通常会先解析 PDF、分块、检索，再把片段塞进 prompt。这个网关侧能力只负责“原文件直传到 ChatGPT 网页”。如果要在 OpenWebUI 里获得这种效果，还要在 OpenWebUI 侧绕开本地 PDF 解析，把原文件交给这个网关。
 
 ## 图片编辑请求
 

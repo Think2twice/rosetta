@@ -29,13 +29,13 @@ Requires Node ≥ 22.
 
 ## OpenAI-compatible gateway
 
-This fork includes a Docker example that exposes Rosetta through a small OpenAI-style HTTP API:
+This repository includes a Docker example that exposes Rosetta through a small OpenAI-style HTTP API:
 
 ```text
 examples/openai-compatible-gateway/
 ```
 
-It supports text chat, image inputs in `messages[].content`, image generation, and local URLs for generated images. The example README is intentionally explicit about login, noVNC, CDP, image extraction, and the parts that should stay private.
+It supports text chat, image and file inputs in `messages[].content`, image generation, and local URLs for generated images. The example README is intentionally explicit about login, noVNC, CDP, file upload, image extraction, and the parts that should stay private.
 
 ## Setup: launch Chrome
 

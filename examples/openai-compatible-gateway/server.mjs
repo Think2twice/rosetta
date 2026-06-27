@@ -14,8 +14,9 @@ const DEFAULT_MODEL = process.env.ROSETTA_DEFAULT_MODEL || "gpt-5-5";
 const MAX_BODY_BYTES = 30 * 1024 * 1024;
 const IMAGE_DIR = process.env.ROSETTA_IMAGE_DIR || "/data/generated-images";
 const UPLOAD_DIR = process.env.ROSETTA_UPLOAD_DIR || "/data/uploads/openai";
-const MAX_INPUT_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_INPUT_ATTACHMENT_BYTES = Number(process.env.ROSETTA_MAX_INPUT_ATTACHMENT_BYTES || 20 * 1024 * 1024);
 const PUBLIC_BASE_URL = (process.env.ROSETTA_PUBLIC_BASE_URL || "").replace(/\/+$/, "");
+const ALLOW_LOCAL_FILE_PATHS = process.env.ROSETTA_ALLOW_LOCAL_FILE_PATHS === "true";
 
 const exposedModels = [
   "gpt-5.5",
@@ -66,7 +67,7 @@ function textFromContent(content) {
         if (typeof part === "string") return part;
         if (!part || typeof part !== "object") return "";
         if (typeof part.text === "string") return part.text;
-        if (part.type === "image_url" || part.type === "input_image") return "";
+        if (["image_url", "input_image", "input_file", "file", "file_url"].includes(part.type)) return "";
         if (part.type === "input_text" && typeof part.text === "string") return part.text;
         return "";
       })
@@ -97,14 +98,70 @@ function imageUrlFromPart(part) {
   return null;
 }
 
-function imageUrlsFromContent(content) {
-  if (!Array.isArray(content)) return [];
-  return content.map(imageUrlFromPart).filter(Boolean);
+function attachmentSpecFromPart(part) {
+  const imageUrl = imageUrlFromPart(part);
+  if (imageUrl) return { source: imageUrl, kind: "image" };
+
+  if (!part || typeof part !== "object") return null;
+  if (!["input_file", "file", "file_url"].includes(part.type)) return null;
+
+  const file = part.file && typeof part.file === "object" ? part.file : {};
+  const fileUrl = part.file_url && typeof part.file_url === "object" ? part.file_url : {};
+  const source =
+    part.file_data ||
+    part.data ||
+    part.url ||
+    part.file_url ||
+    file.file_data ||
+    file.data ||
+    file.url ||
+    fileUrl.url;
+  if (typeof source !== "string" || !source.trim()) return null;
+
+  const name =
+    part.filename ||
+    part.name ||
+    file.filename ||
+    file.name ||
+    fileUrl.filename ||
+    fileUrl.name ||
+    null;
+  const mimeType =
+    part.mimeType ||
+    part.mime_type ||
+    (typeof part.media_type === "string" ? part.media_type : null) ||
+    (typeof file.mimeType === "string" ? file.mimeType : null) ||
+    (typeof file.mime_type === "string" ? file.mime_type : null) ||
+    (typeof file.type === "string" && file.type.includes("/") ? file.type : null);
+
+  return { source, name, mimeType, kind: "file" };
 }
 
-function imageUrlsFromMessages(messages) {
+function attachmentSpecFromLooseFile(file) {
+  if (!file || typeof file !== "object") return null;
+  const source = file.file_data || file.data || file.url || file.file_url || file.download_url || file.path;
+  if (typeof source !== "string" || !source.trim()) return null;
+  const mimeType =
+    file.mimeType ||
+    file.mime_type ||
+    (typeof file.type === "string" && file.type.includes("/") ? file.type : null) ||
+    null;
+  return {
+    source,
+    name: file.filename || file.name || null,
+    mimeType,
+    kind: mimeType?.startsWith("image/") ? "image" : "file",
+  };
+}
+
+function attachmentSpecsFromContent(content) {
+  if (!Array.isArray(content)) return [];
+  return content.map(attachmentSpecFromPart).filter(Boolean);
+}
+
+function attachmentSpecsFromMessages(messages) {
   if (!Array.isArray(messages)) return [];
-  return messages.flatMap((message) => imageUrlsFromContent(message?.content));
+  return messages.flatMap((message) => attachmentSpecsFromContent(message?.content));
 }
 
 function extensionFromUrl(url) {
@@ -115,42 +172,118 @@ function extensionFromUrl(url) {
   return null;
 }
 
-function assertInputImageSize(buffer, source) {
-  if (buffer.length > MAX_INPUT_IMAGE_BYTES) {
-    throw new Error(`input image is too large (${buffer.length} bytes): ${source}`);
+function mimeFromFileName(fileName) {
+  const ext = path.extname(String(fileName || "")).toLowerCase();
+  const map = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".pdf": "application/pdf",
+    ".csv": "text/csv",
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".json": "application/json",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  };
+  return map[ext] || "application/octet-stream";
+}
+
+function extensionForMime(mime) {
+  const normalized = String(mime || "").split(";")[0].trim().toLowerCase();
+  const map = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "application/pdf": "pdf",
+    "text/csv": "csv",
+    "text/plain": "txt",
+    "text/markdown": "md",
+    "application/json": "json",
+    "application/msword": "doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.ms-excel": "xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "application/vnd.ms-powerpoint": "ppt",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+  };
+  return map[normalized] || null;
+}
+
+function sanitizeFileName(name, fallbackExt) {
+  const base = path.basename(String(name || "")).replace(/[^\w.-]+/g, "_").replace(/^_+|_+$/g, "");
+  const trimmed = base.slice(0, 96);
+  if (trimmed && path.extname(trimmed)) return trimmed;
+  const ext = fallbackExt ? `.${fallbackExt}` : "";
+  return `${trimmed || "attachment"}${ext}`;
+}
+
+function safeDecodeURIComponent(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
   }
 }
 
-async function materializeInputImage(imageUrl, index) {
+function assertInputAttachmentSize(buffer, source) {
+  if (buffer.length > MAX_INPUT_ATTACHMENT_BYTES) {
+    throw new Error(`input attachment is too large (${buffer.length} bytes): ${source}`);
+  }
+}
+
+async function materializeInputAttachment(spec, index) {
   await mkdir(UPLOAD_DIR, { recursive: true });
-  let mime = "image/png";
+  let mime = spec.mimeType || "application/octet-stream";
   let buffer;
-  const dataMatch = /^data:([^;,]+);base64,(.+)$/s.exec(String(imageUrl));
+  let sourceName = spec.name || null;
+  const source = String(spec.source || "");
+  const dataMatch = /^data:([^;,]+);base64,(.+)$/s.exec(source);
   if (dataMatch) {
     mime = dataMatch[1].toLowerCase();
     buffer = Buffer.from(dataMatch[2], "base64");
-  } else if (/^https?:\/\//i.test(String(imageUrl))) {
-    const response = await fetch(imageUrl);
-    if (!response.ok) throw new Error(`failed to fetch input image: ${response.status}`);
-    mime = (response.headers.get("content-type") || "image/png").split(";")[0].trim().toLowerCase();
+  } else if (/^https?:\/\//i.test(source)) {
+    const response = await fetch(source);
+    if (!response.ok) throw new Error(`failed to fetch input attachment: ${response.status}`);
+    mime = (response.headers.get("content-type") || mime).split(";")[0].trim().toLowerCase();
+    const disposition = response.headers.get("content-disposition") || "";
+    const nameMatch = /filename\*?=(?:UTF-8''|")?([^";]+)/i.exec(disposition);
+    if (!sourceName && nameMatch) sourceName = safeDecodeURIComponent(nameMatch[1]);
+    if (!sourceName) sourceName = path.basename(new URL(source).pathname);
     buffer = Buffer.from(await response.arrayBuffer());
+  } else if (ALLOW_LOCAL_FILE_PATHS && path.isAbsolute(source)) {
+    sourceName = sourceName || path.basename(source);
+    buffer = await readFile(source);
+    if (!spec.mimeType) mime = mimeFromFileName(sourceName);
   } else {
-    throw new Error("unsupported input image_url; use data:image/...;base64 or http(s) URL");
+    throw new Error("unsupported attachment source; use data:...;base64, http(s) URL, or enable ROSETTA_ALLOW_LOCAL_FILE_PATHS for absolute local paths");
   }
-  if (!mime.startsWith("image/")) throw new Error(`input image must be image/*, got ${mime}`);
-  assertInputImageSize(buffer, imageUrl.slice(0, 64));
-  const ext = extensionForMime(mime) || extensionFromUrl(imageUrl) || "png";
-  const fileName = `${Date.now()}-${index}-${randomUUID()}.${ext}`;
+
+  assertInputAttachmentSize(buffer, source.slice(0, 64));
+  const ext = extensionForMime(mime) || extensionFromUrl(source) || path.extname(sourceName || "").replace(/^\./, "") || "bin";
+  const safeName = sanitizeFileName(sourceName, ext);
+  const fileName = `${Date.now()}-${index}-${randomUUID()}-${safeName}`;
   const filePath = path.join(UPLOAD_DIR, fileName);
   await writeFile(filePath, buffer);
   return { path: filePath, mimeType: mime };
 }
 
-async function attachmentsFromMessages(messages) {
-  const urls = imageUrlsFromMessages(messages);
+async function attachmentsFromRequest(body) {
+  const specs = [
+    ...attachmentSpecsFromMessages(body?.messages),
+    ...(Array.isArray(body?.files) ? body.files.map(attachmentSpecFromLooseFile).filter(Boolean) : []),
+    ...(Array.isArray(body?.attachments) ? body.attachments.map(attachmentSpecFromLooseFile).filter(Boolean) : []),
+  ];
   const attachments = [];
-  for (let i = 0; i < urls.length; i += 1) {
-    attachments.push(await materializeInputImage(urls[i], i));
+  for (let i = 0; i < specs.length; i += 1) {
+    attachments.push(await materializeInputAttachment(specs[i], i));
   }
   return attachments;
 }
@@ -236,13 +369,6 @@ async function extractGeneratedImages(Runtime) {
     returnByValue: true,
   });
   return Array.isArray(result.result?.value) ? uniqueImages(result.result.value) : [];
-}
-
-function extensionForMime(mime) {
-  if (mime === "image/jpeg") return "jpg";
-  if (mime === "image/webp") return "webp";
-  if (mime === "image/gif") return "gif";
-  return "png";
 }
 
 async function fetchImageDataUrl(Runtime, url) {
@@ -486,20 +612,21 @@ async function handleChat(req, res) {
   }
 
   const model = mapModel(body.model);
-  const prompt = body.prompt || messagesToPrompt(body.messages);
-  if (!prompt) return sendJson(res, 400, openaiError("messages or prompt is required", "invalid_request_error", "bad_request"));
   let attachments = [];
   try {
-    attachments = await attachmentsFromMessages(body.messages);
+    attachments = await attachmentsFromRequest(body);
   } catch (err) {
     return sendJson(res, 400, openaiError(err?.message || String(err), "invalid_request_error", "bad_request"));
   }
+  const prompt = body.prompt || messagesToPrompt(body.messages) || (attachments.length ? "Please analyze the attached file." : "");
+  if (!prompt) return sendJson(res, 400, openaiError("messages, prompt, or attachments are required", "invalid_request_error", "bad_request"));
   const requestedEffort = body.thinking_effort ?? body.thinkingEffort;
   const thinkingEffort = requestedEffort ?? (/-pro$/.test(model) ? "standard" : undefined);
   const runInput = { prompt, model };
   if (thinkingEffort !== undefined) runInput.thinkingEffort = thinkingEffort;
   if (attachments.length) runInput.attachments = attachments;
-  const collectImagesForRequest = shouldCollectImages(body, prompt) || attachments.length > 0;
+  const inputImages = attachments.filter((attachment) => String(attachment.mimeType || "").startsWith("image/")).length;
+  const collectImagesForRequest = shouldCollectImages(body, prompt) || inputImages > 0;
 
   let session;
   const id = `chatcmpl-rosetta-${randomUUID().replaceAll("-", "")}`;
@@ -552,7 +679,7 @@ async function handleChat(req, res) {
       choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
       images,
-      rosetta: { modelSlug: result.modelSlug, conversationId: result.conversationId, messageId: result.messageId, tookMs: result.tookMs, images, inputImages: attachments.length },
+      rosetta: { modelSlug: result.modelSlug, conversationId: result.conversationId, messageId: result.messageId, tookMs: result.tookMs, images, inputImages, inputFiles: attachments.length },
     });
   } catch (err) {
     const status = err instanceof RosettaAuthError || String(err?.message || err).includes("not logged in") ? 503 : 502;
